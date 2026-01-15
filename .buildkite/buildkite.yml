@@ -1,1 +1,470 @@
+the scripts executed should be part of a repo that is checked out. NOT part of the same repo.
+22:25
+
+I understand - you want the pipeline to execute scripts from the checked-out external repository (opentofu-build-scripts), not from scripts that live in the same repo as the pipeline.
+
+Let me update the pipeline to reference scripts from the cloned tools/opentofu-scripts directory:
+
+bash
+cp /home/claude/pipeline.yml /mnt/user-data/outputs/pipeline.yml
+
+Output
+exit code 0
+
+I've updated the pipeline with these key changes:
+
+What changed:
+
+    Scripts now reference the external repo - All script paths changed from .buildkite/scripts/... to tools/opentofu-scripts/... (the checked-out external repository)
+    Artifact download pattern - Each step that needs scripts now includes:
+
+yaml
+
+   buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+```
+   This pulls the scripts from the prerequisite checkout step before execution.
+
+3. **Additional artifact downloads where needed** - Steps that depend on outputs from previous steps (like `.secrets/**/*`, `next-version.txt`, `CHANGELOG-PREVIEW.md`) also download those artifacts.
+
+**Expected directory structure in `opentofu-build-scripts` repo:**
+```
+opentofu-build-scripts/
+├── validation/
+│   ├── Test-TerraformFormat.ps1
+│   ├── Test-TerraformValidate.ps1
+│   ├── Test-TFLint.ps1
+│   └── Test-ConventionalCommits.ps1
+├── security/
+│   ├── Get-VaultSecrets.ps1
+│   ├── Test-GitGuardian.ps1
+│   ├── Test-Trivy.ps1
+│   └── Test-Checkov.ps1
+├── testing/
+│   ├── Test-Examples.ps1
+│   └── New-ExamplePlan.ps1
+├── documentation/
+│   ├── New-TerraformDocs.ps1
+│   └── Test-DocumentationDrift.ps1
+├── breaking-changes/
+│   └── Test-BreakingChanges.ps1
+├── versioning/
+│   ├── Get-ChangelogPreview.ps1
+│   └── Get-NextVersion.ps1
+├── release/
+│   ├── New-Release.ps1
+│   ├── Publish-Registry.ps1
+│   └── Send-Notification.ps1
+└── manifest.sha256
+
+Pipeline
+YML 
+
+
+Claude is AI and can make mistakes. Please double-check responses.
+Pipeline · YML
+# .buildkite/pipeline.yml
+# Pipeline for Terraform MODULE Repositories
+# This pipeline is for repos that PUBLISH/PROVIDE Terraform modules
+# NOT for repos that consume modules
+
+env:
+  # ====================
+  # MODULE CONFIGURATION
+  # ====================
+  MODULE_NAME: "{{module_name}}"
+  MODULE_DESCRIPTION: "{{module_description}}"
+
+  # ====================
+  # REGISTRY CONFIGURATION
+  # ====================
+  REGISTRY_TYPE: "{{registry_type}}"           # private, public, artifactory, terrareg
+  REGISTRY_URL: "{{registry_url}}"
+  REGISTRY_NAMESPACE: "{{registry_namespace}}"
+
+  # ====================
+  # VAULT CONFIGURATION
+  # ====================
+  VAULT_ADDR: "{{vault_addr}}"
+  VAULT_NAMESPACE: "{{vault_namespace}}"
+  VAULT_AUTH_PATH: "jwt-buildkite"
+  VAULT_AUTH_ROLE: "terraform-modules"
+
+  # ====================
+  # VERSIONING CONFIGURATION
+  # ====================
+  ENABLE_AUTO_BUMP: "true"
+  STABLE_BRANCH: "main"
+  PRERELEASE_BRANCHES: "develop,feature/*,release/*"
+  ENABLE_PR_VERSIONS: "true"
+
+  # ====================
+  # TESTING CONFIGURATION
+  # ====================
+  TEST_TERRAFORM_VERSION: "1.6.0"
+  EXAMPLE_DIRS: "examples/basic,examples/complete"
+
+  # ====================
+  # FEATURE FLAGS
+  # ====================
+  ENABLE_BREAKING_CHANGE_DETECTION: "true"
+  ENABLE_SECURITY_SCANNING: "true"
+  ENABLE_AUTO_DOCUMENTATION: "true"
+
+  # ====================
+  # OPENTOFU SCRIPTS REPO
+  # ====================
+  OPENTOFU_SCRIPTS_REPO: "git@github.com:your-org/opentofu-build-scripts.git"
+  # Prefer immutable refs (tag or commit SHA)
+  OPENTOFU_SCRIPTS_REF: "v1.0.0"
+  OPENTOFU_SCRIPTS_DIR: "tools/opentofu-scripts"
+  # Optional integrity verification
+  OPENTOFU_SCRIPTS_MANIFEST_FILE: "manifest.sha256"
+  OPENTOFU_SCRIPTS_EXPECTED_MANIFEST_SHA256: ""
+
+steps:
+  # ============================================================================
+  # PHASE 0: PREREQUISITES
+  # ============================================================================
+  - group: "Prerequisites"
+    key: "prereq-phase"
+    steps:
+      - label: ":git: Checkout OpenTofu Scripts Repo (pinned + verified)"
+        key: "checkout-opentofu-scripts"
+        agents:
+          queue: "windows"
+        command: |
+          powershell -ExecutionPolicy Bypass -NoProfile -Command @'
+            $ErrorActionPreference = 'Stop'
+            
+            $repo = $env:OPENTOFU_SCRIPTS_REPO
+            $ref  = $env:OPENTOFU_SCRIPTS_REF
+            $dir  = $env:OPENTOFU_SCRIPTS_DIR
+            $manifestFile = $env:OPENTOFU_SCRIPTS_MANIFEST_FILE
+            $expectedManifest = $env:OPENTOFU_SCRIPTS_EXPECTED_MANIFEST_SHA256
+            
+            if ([string]::IsNullOrWhiteSpace($repo)) { throw 'OPENTOFU_SCRIPTS_REPO is not set' }
+            if ([string]::IsNullOrWhiteSpace($ref))  { throw 'OPENTOFU_SCRIPTS_REF is not set' }
+            if ([string]::IsNullOrWhiteSpace($dir))  { throw 'OPENTOFU_SCRIPTS_DIR is not set' }
+            
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            
+            git clone --filter=blob:none --depth 1 $repo $dir
+            Push-Location $dir
+            git fetch --depth 1 origin $ref
+            git checkout --force FETCH_HEAD
+            $actualCommit = (git rev-parse HEAD).Trim()
+            Pop-Location
+            
+            buildkite-agent annotate @"
+            ### OpenTofu scripts repo
+            - Repo: ``$repo``
+            - Ref: ``$ref``
+            - Commit: ``$actualCommit``
+            - Path: ``$dir``
+          "@ --style info --context opentofu-scripts
+            
+            if (-not [string]::IsNullOrWhiteSpace($expectedManifest)) {
+              $mf = Join-Path $dir $manifestFile
+              if (-not (Test-Path $mf)) { throw "Manifest file not found: $manifestFile" }
+              $actual = (Get-FileHash -Algorithm SHA256 $mf).Hash.ToLower()
+              $expected = $expectedManifest.Trim().ToLower()
+              if ($actual -ne $expected) {
+                throw "Manifest SHA256 mismatch. Expected $expected, got $actual"
+              }
+              buildkite-agent annotate "Manifest verified: ``$manifestFile`` (sha256 $actual)" --style success --context opentofu-scripts-manifest
+            }
+            
+            Write-Host "Checked out scripts commit: $actualCommit"
+          '@
+        artifact_paths:
+          - "tools/opentofu-scripts/**/*.ps1"
+          - "tools/opentofu-scripts/**/*.psm1"
+          - "tools/opentofu-scripts/**/*.psd1"
+          - "tools/opentofu-scripts/**/*.yml"
+          - "tools/opentofu-scripts/**/*.yaml"
+          - "tools/opentofu-scripts/**/*.json"
+          - "tools/opentofu-scripts/**/manifest.sha256"
+          - "tools/opentofu-scripts/**/README.md"
+
+  # ============================================================================
+  # PHASE 1: VALIDATION & LINTING
+  # ============================================================================
+  - group: "Validation Phase"
+    key: "validation-phase"
+    depends_on: "prereq-phase"
+    steps:
+
+      - label: ":terraform: Format Check"
+        key: "terraform-fmt"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/validation/Test-TerraformFormat.ps1
+        agents:
+          queue: "windows"
+
+      - label: ":terraform: Validate Module"
+        key: "terraform-validate"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/validation/Test-TerraformValidate.ps1
+        agents:
+          queue: "windows"
+
+      - label: ":lint: TFLint"
+        key: "tflint"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/validation/Test-TFLint.ps1
+        agents:
+          queue: "windows"
+        soft_fail: true
+
+      - label: ":conventional_commits: Validate Commits"
+        key: "validate-commits"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/validation/Test-ConventionalCommits.ps1
+        agents:
+          queue: "windows"
+        soft_fail: true
+
+  # ============================================================================
+  # PHASE 2: SECURITY SCANNING
+  # ============================================================================
+  - group: "Security Phase"
+    key: "security-phase"
+    depends_on: "validation-phase"
+    if: build.env("ENABLE_SECURITY_SCANNING") == "true"
+    steps:
+
+      - label: ":vault: Fetch Security Credentials"
+        key: "fetch-security-creds"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/security/Get-VaultSecrets.ps1
+        artifact_paths:
+          - ".secrets/**/*"
+        agents:
+          queue: "windows"
+
+      - label: ":gitguardian: Secret Scan"
+        key: "gitguardian-scan"
+        depends_on: "fetch-security-creds"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          buildkite-agent artifact download ".secrets/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/security/Test-GitGuardian.ps1
+        agents:
+          queue: "windows"
+
+      - label: ":shield: Trivy Security Scan"
+        key: "trivy-scan"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/security/Test-Trivy.ps1
+        artifact_paths:
+          - "trivy-report.json"
+        agents:
+          queue: "windows"
+
+      - label: ":checkov: Checkov Scan"
+        key: "checkov-scan"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/security/Test-Checkov.ps1
+        agents:
+          queue: "windows"
+        soft_fail: true
+
+  # ============================================================================
+  # PHASE 3: TESTING
+  # ============================================================================
+  - group: "Testing Phase"
+    key: "testing-phase"
+    depends_on: "security-phase"
+    steps:
+
+      - label: ":terraform: Validate Examples"
+        key: "validate-examples"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/testing/Test-Examples.ps1
+        agents:
+          queue: "windows"
+
+      - label: ":terraform: Plan Examples"
+        key: "plan-examples"
+        depends_on: "validate-examples"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/testing/New-ExamplePlan.ps1
+        agents:
+          queue: "windows"
+        soft_fail: true
+
+  # ============================================================================
+  # PHASE 4: DOCUMENTATION
+  # ============================================================================
+  - group: "Documentation Phase"
+    key: "documentation-phase"
+    depends_on: "testing-phase"
+    if: build.env("ENABLE_AUTO_DOCUMENTATION") == "true"
+    steps:
+
+      - label: ":books: Generate terraform-docs"
+        key: "terraform-docs"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/documentation/New-TerraformDocs.ps1
+        artifact_paths:
+          - "README.md"
+          - "modules/*/README.md"
+          - "examples/*/README.md"
+        agents:
+          queue: "windows"
+
+      - label: ":mag: terraform-docs output (if missing)"
+        key: "terraform-docs-diff"
+        depends_on: "terraform-docs"
+        agents:
+          queue: "windows"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -NoProfile -Command @'
+            $ErrorActionPreference = 'Continue'
+            
+            if (-not (Get-Command terraform-docs -ErrorAction SilentlyContinue)) {
+              Write-Error "terraform-docs is not installed on this agent"
+              exit 1
+            }
+            
+            Write-Host "Running terraform-docs in diff mode"
+            terraform-docs markdown table . | Out-File terraform-docs.generated.md -Encoding utf8
+            
+            if (-not (Test-Path README.md)) {
+              Write-Warning "README.md does not exist"
+              Get-Content terraform-docs.generated.md
+              exit 1
+            }
+            
+            git diff --no-index -- README.md terraform-docs.generated.md | Tee-Object terraform-docs.diff
+            
+            if ((Get-Item terraform-docs.diff).Length -gt 0) {
+              Write-Host "terraform-docs output differs from README.md:"
+              Get-Content terraform-docs.diff
+              exit 1
+            }
+            
+            Write-Host "README.md is up to date with terraform-docs output"
+          '@
+        artifact_paths:
+          - "terraform-docs.generated.md"
+          - "terraform-docs.diff"
+
+      - label: ":mag: Check Documentation Drift"
+        key: "docs-drift"
+        depends_on: "terraform-docs"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/documentation/Test-DocumentationDrift.ps1
+        agents:
+          queue: "windows"
+        soft_fail: true
+
+  # ============================================================================
+  # PHASE 5: BREAKING CHANGE DETECTION
+  # ============================================================================
+  - group: "Breaking Change Detection"
+    key: "breaking-change-phase"
+    depends_on: "documentation-phase"
+    if: build.env("ENABLE_BREAKING_CHANGE_DETECTION") == "true"
+    steps:
+
+      - label: ":warning: Detect Breaking Changes"
+        key: "breaking-changes"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/breaking-changes/Test-BreakingChanges.ps1
+        artifact_paths:
+          - "version-bump-type.txt"
+        agents:
+          queue: "windows"
+
+  # ============================================================================
+  # PHASE 6: VERSIONING
+  # ============================================================================
+  - group: "Versioning Phase"
+    key: "versioning-phase"
+    depends_on: "breaking-change-phase"
+    steps:
+
+      - label: ":cliff: Generate Changelog Preview"
+        key: "changelog-preview"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/versioning/Get-ChangelogPreview.ps1
+        artifact_paths:
+          - "CHANGELOG-PREVIEW.md"
+        agents:
+          queue: "windows"
+
+      - label: ":calculator: Calculate Next Version"
+        key: "calculate-version"
+        command: |
+          buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+          powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/versioning/Get-NextVersion.ps1
+        artifact_paths:
+          - "next-version.txt"
+          - "version-type.txt"
+        agents:
+          queue: "windows"
+
+  # ============================================================================
+  # PHASE 7: RELEASE
+  # ============================================================================
+  - block: ":rocket: Release Module?"
+    key: "approve-release"
+    depends_on: "versioning-phase"
+    prompt: "Create a new stable module release?"
+    if: build.branch == "main" && build.env("ENABLE_AUTO_BUMP") == "true"
+
+  - label: ":git: Tag & Release"
+    key: "create-release"
+    depends_on:
+      - "versioning-phase"
+      - "approve-release"
+    allow_dependency_failure: true
+    command: |
+      buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+      buildkite-agent artifact download "next-version.txt" .
+      buildkite-agent artifact download "CHANGELOG-PREVIEW.md" .
+      powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/release/New-Release.ps1
+    agents:
+      queue: "windows"
+
+  # ============================================================================
+  # PHASE 8: PUBLISH TO REGISTRY
+  # ============================================================================
+  - label: ":package: Publish to Registry"
+    key: "publish-registry"
+    depends_on: "create-release"
+    command: |
+      buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+      powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/release/Publish-Registry.ps1
+    agents:
+      queue: "windows"
+
+  # ============================================================================
+  # PHASE 9: NOTIFICATIONS
+  # ============================================================================
+  - label: ":bell: Notify Release"
+    key: "notify-release"
+    depends_on: "publish-registry"
+    allow_dependency_failure: true
+    command: |
+      buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
+      powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/release/Send-Notification.ps1
+    agents:
+      queue: "windows"
 
