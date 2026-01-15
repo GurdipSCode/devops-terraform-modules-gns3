@@ -1,67 +1,3 @@
-the scripts executed should be part of a repo that is checked out. NOT part of the same repo.
-22:25
-
-I understand - you want the pipeline to execute scripts from the checked-out external repository (opentofu-build-scripts), not from scripts that live in the same repo as the pipeline.
-
-Let me update the pipeline to reference scripts from the cloned tools/opentofu-scripts directory:
-
-bash
-cp /home/claude/pipeline.yml /mnt/user-data/outputs/pipeline.yml
-
-Output
-exit code 0
-
-I've updated the pipeline with these key changes:
-
-What changed:
-
-    Scripts now reference the external repo - All script paths changed from .buildkite/scripts/... to tools/opentofu-scripts/... (the checked-out external repository)
-    Artifact download pattern - Each step that needs scripts now includes:
-
-yaml
-
-   buildkite-agent artifact download "tools/opentofu-scripts/**/*" .
-```
-   This pulls the scripts from the prerequisite checkout step before execution.
-
-3. **Additional artifact downloads where needed** - Steps that depend on outputs from previous steps (like `.secrets/**/*`, `next-version.txt`, `CHANGELOG-PREVIEW.md`) also download those artifacts.
-
-**Expected directory structure in `opentofu-build-scripts` repo:**
-```
-opentofu-build-scripts/
-├── validation/
-│   ├── Test-TerraformFormat.ps1
-│   ├── Test-TerraformValidate.ps1
-│   ├── Test-TFLint.ps1
-│   └── Test-ConventionalCommits.ps1
-├── security/
-│   ├── Get-VaultSecrets.ps1
-│   ├── Test-GitGuardian.ps1
-│   ├── Test-Trivy.ps1
-│   └── Test-Checkov.ps1
-├── testing/
-│   ├── Test-Examples.ps1
-│   └── New-ExamplePlan.ps1
-├── documentation/
-│   ├── New-TerraformDocs.ps1
-│   └── Test-DocumentationDrift.ps1
-├── breaking-changes/
-│   └── Test-BreakingChanges.ps1
-├── versioning/
-│   ├── Get-ChangelogPreview.ps1
-│   └── Get-NextVersion.ps1
-├── release/
-│   ├── New-Release.ps1
-│   ├── Publish-Registry.ps1
-│   └── Send-Notification.ps1
-└── manifest.sha256
-
-Pipeline
-YML 
-
-
-Claude is AI and can make mistakes. Please double-check responses.
-Pipeline · YML
 # .buildkite/pipeline.yml
 # Pipeline for Terraform MODULE Repositories
 # This pipeline is for repos that PUBLISH/PROVIDE Terraform modules
@@ -467,4 +403,3 @@ steps:
       powershell -ExecutionPolicy Bypass -File tools/opentofu-scripts/release/Send-Notification.ps1
     agents:
       queue: "windows"
-
